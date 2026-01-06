@@ -59,53 +59,17 @@ fn show_break_notification(
         .unwrap();
     }
 
-    let mut handle = Notification::new()
+    Notification::new()
         .summary(&gettext("Break Time!"))
         .body(&message)
         .appname(&gettext("Ianny"))
         .hint(notification_sound_hint)
-        .hint(Hint::Urgency(Urgency::Critical))
-        .hint(Hint::Resident(true))
-        .timeout(Timeout::Never)
+        .hint(Hint::Urgency(Urgency::Low))
+        .timeout(Timeout::Milliseconds(break_time.as_millis().try_into().unwrap()))
         .show()
         .expect("Failed to send notification");
 
-    let mut last_time = Instant::now();
-    let mut accumulative_time = Duration::from_secs(0);
-    #[expect(clippy::cast_precision_loss, reason = "Working with small numbers")]
-    let step =
-        CONFIG.notification.minimum_update_delay as f64 / break_time.as_secs_f64() * 100.0_f64;
-    let step_duration = Duration::from_secs(CONFIG.notification.minimum_update_delay);
-
-    let mut i: f64 = 0.0;
-
-    #[expect(clippy::while_float, reason = "Precision is not an issue")]
-    while i < 100.0_f64 {
-        std::thread::sleep(step_duration);
-        let last_time_copy = last_time;
-        last_time = Instant::now();
-        let time_diff = Instant::now().duration_since(last_time_copy);
-
-        accumulative_time += time_diff;
-
-        i += step * time_diff.div_duration_f64(step_duration);
-
-        if CONFIG.notification.show_progress_bar {
-            // FIX: Floating point problems leads to update when not needed.
-            // HACK: The f64 data type is used to minimize the impact.
-            #[expect(clippy::cast_possible_truncation, reason = "Truncation is intentional")]
-            if (i as i32) != ((i - step) as i32) {
-                // Progress bar update
-                handle.hint(Hint::CustomInt("value".to_owned(), i as i32));
-            }
-        }
-
-        handle.update();
-    }
-
-    handle.close();
-
-    accumulative_time
+    break_time
 }
 
 fn main() -> ! {
