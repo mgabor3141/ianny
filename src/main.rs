@@ -65,7 +65,7 @@ fn show_break_notification(
         .appname(&gettext("Ianny"))
         .hint(notification_sound_hint)
         .hint(Hint::Urgency(Urgency::Low))
-        .timeout(Timeout::Milliseconds(break_time.as_millis()))
+        .timeout(Timeout::Milliseconds(break_time.as_millis().try_into().unwrap()))
         .show()
         .expect("Failed to send notification");
 
