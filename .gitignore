@@ -1,2 +1,6 @@
 /target
-/build
+/pkg
+/src/ianny-custom
+/*.pkg.tar.zst
+/_build
+/_makepkg_build
