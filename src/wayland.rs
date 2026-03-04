@@ -13,15 +13,33 @@ use crate::CONFIG;
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum Signal {
+    /// User input stopped (ignoring idle inhibitors)
     Idled,
+    /// User input resumed
     Resumed,
+    /// Compositor idle (respects inhibitors) — fires only when no inhibitors active
+    InhibitorIdled,
+    /// Compositor idle resumed (respects inhibitors)
+    InhibitorResumed,
+}
+
+/// Tag to distinguish which idle notification sent an event.
+#[derive(Debug, Clone, Copy)]
+enum IdleNotificationKind {
+    /// Input-only (ignores inhibitors)
+    Input,
+    /// Standard (respects inhibitors)
+    Inhibitor,
 }
 
 type GlobalName = u32;
 
 pub struct State {
     idle_notifier: Option<(GlobalName, ext_idle_notifier_v1::ExtIdleNotifierV1)>,
-    idle_notification: Option<ext_idle_notification_v1::ExtIdleNotificationV1>,
+    /// Input-only idle notification (ignores inhibitors)
+    input_idle_notification: Option<ext_idle_notification_v1::ExtIdleNotificationV1>,
+    /// Standard idle notification (respects inhibitors)
+    inhibitor_idle_notification: Option<ext_idle_notification_v1::ExtIdleNotificationV1>,
     signal_sender: mpsc::SyncSender<Signal>,
 }
 
@@ -29,7 +47,8 @@ impl State {
     pub const fn new(signal_sender: mpsc::SyncSender<Signal>) -> Self {
         Self {
             idle_notifier: None,
-            idle_notification: None,
+            input_idle_notification: None,
+            inhibitor_idle_notification: None,
             signal_sender,
         }
     }
@@ -75,21 +94,24 @@ impl wayland_client::Dispatch<wl_registry::WlRegistry, ()> for State {
                 }
             }
             wl_registry::Event::GlobalRemove { name } => {
-                if let Some((idle_notifier_name, idle_notifier)) = &state.idle_notifier {
-                    if name == *idle_notifier_name {
+                if let Some((idle_notifier_name, idle_notifier)) = &state.idle_notifier
+                    && name == *idle_notifier_name {
                         idle_notifier.destroy();
                         state.idle_notifier = None;
 
                         trace!("Destroyed ext_idle_notifier_v1");
 
-                        if let Some(idle_notification) = &state.idle_notification {
-                            idle_notification.destroy();
-                            state.idle_notification = None;
-
-                            trace!("Destroyed ext_idle_notification_v1");
+                        if let Some(n) = &state.input_idle_notification {
+                            n.destroy();
+                            state.input_idle_notification = None;
+                            trace!("Destroyed input idle notification");
+                        }
+                        if let Some(n) = &state.inhibitor_idle_notification {
+                            n.destroy();
+                            state.inhibitor_idle_notification = None;
+                            trace!("Destroyed inhibitor idle notification");
                         }
                     }
-                }
             }
             _ => {}
         }
@@ -107,20 +129,43 @@ impl wayland_client::Dispatch<wl_seat::WlSeat, ()> for State {
     ) {
         // FIX: Support multiseat configuration.
         if let Some((_, idle_notifier)) = &state.idle_notifier {
-            let idle_timeout = CONFIG.timer.idle_timeout * 1000; // milliseconds
+            let idle_timeout = CONFIG.timer.idle_detection_threshold * 1000; // milliseconds
 
-            if let Some(idle_notification) = &state.idle_notification {
-                idle_notification.destroy();
-                state.idle_notification = None;
-
-                trace!("Destroyed ext_idle_notification_v1");
+            // Destroy existing notifications
+            if let Some(n) = &state.input_idle_notification {
+                n.destroy();
+                state.input_idle_notification = None;
+                trace!("Destroyed input idle notification");
+            }
+            if let Some(n) = &state.inhibitor_idle_notification {
+                n.destroy();
+                state.inhibitor_idle_notification = None;
+                trace!("Destroyed inhibitor idle notification");
             }
 
-            let idle_notification = if CONFIG.timer.ignore_idle_inhibitors
-                && idle_notifier.version()
-                    >= ext_idle_notifier_v1::REQ_GET_INPUT_IDLE_NOTIFICATION_SINCE
-            {
-                idle_notifier.get_input_idle_notification(idle_timeout, seat, queue_handle, ())
+            // Create input-only idle notification (ignores inhibitors)
+            let supports_input = idle_notifier.version()
+                >= ext_idle_notifier_v1::REQ_GET_INPUT_IDLE_NOTIFICATION_SINCE;
+
+            if CONFIG.timer.ignore_idle_inhibitors && supports_input {
+                let input_notification = idle_notifier.get_input_idle_notification(
+                    idle_timeout,
+                    seat,
+                    queue_handle,
+                    IdleNotificationKind::Input,
+                );
+                trace!("Created input idle notification: {}", input_notification.id());
+                state.input_idle_notification = Some(input_notification);
+
+                // Also create inhibitor-respecting notification for detecting inhibitor state
+                let inhibitor_notification = idle_notifier.get_idle_notification(
+                    idle_timeout,
+                    seat,
+                    queue_handle,
+                    IdleNotificationKind::Inhibitor,
+                );
+                trace!("Created inhibitor idle notification: {}", inhibitor_notification.id());
+                state.inhibitor_idle_notification = Some(inhibitor_notification);
             } else {
                 if CONFIG.timer.ignore_idle_inhibitors {
                     error!(
@@ -128,12 +173,16 @@ impl wayland_client::Dispatch<wl_seat::WlSeat, ()> for State {
                     );
                 }
 
-                idle_notifier.get_idle_notification(idle_timeout, seat, queue_handle, ())
-            };
-
-            trace!("Created {}", idle_notification.id());
-
-            state.idle_notification = Some(idle_notification);
+                // Fall back to standard notification only
+                let notification = idle_notifier.get_idle_notification(
+                    idle_timeout,
+                    seat,
+                    queue_handle,
+                    IdleNotificationKind::Input,
+                );
+                trace!("Created standard idle notification: {}", notification.id());
+                state.input_idle_notification = Some(notification);
+            }
         }
     }
 }
@@ -151,19 +200,20 @@ impl wayland_client::Dispatch<ext_idle_notifier_v1::ExtIdleNotifierV1, ()> for S
     }
 }
 
-impl wayland_client::Dispatch<ext_idle_notification_v1::ExtIdleNotificationV1, ()> for State {
+impl wayland_client::Dispatch<ext_idle_notification_v1::ExtIdleNotificationV1, IdleNotificationKind>
+    for State
+{
     fn event(
         state: &mut Self,
         _idle_notification: &ext_idle_notification_v1::ExtIdleNotificationV1,
         event: ext_idle_notification_v1::Event,
-        _data: &(),
+        data: &IdleNotificationKind,
         _conn: &wayland_client::Connection,
         _queue_handle: &wayland_client::QueueHandle<Self>,
     ) {
-        match event {
-            ext_idle_notification_v1::Event::Idled => {
-                info!("Idled");
-
+        match (data, &event) {
+            (IdleNotificationKind::Input, ext_idle_notification_v1::Event::Idled) => {
+                info!("Idled (input)");
                 match state.signal_sender.try_send(Signal::Idled) {
                     Ok(()) | Err(mpsc::TrySendError::Full(_)) => (),
                     Err(mpsc::TrySendError::Disconnected(_)) => {
@@ -171,13 +221,30 @@ impl wayland_client::Dispatch<ext_idle_notification_v1::ExtIdleNotificationV1, (
                     }
                 }
             }
-            ext_idle_notification_v1::Event::Resumed => {
-                info!("Resumed");
-
+            (IdleNotificationKind::Input, ext_idle_notification_v1::Event::Resumed) => {
+                info!("Resumed (input)");
                 match state.signal_sender.try_send(Signal::Resumed) {
                     Ok(()) | Err(mpsc::TrySendError::Full(_)) => (),
                     Err(mpsc::TrySendError::Disconnected(_)) => {
                         panic!("Timer disconnected, `Resumed` signal could not be sent")
+                    }
+                }
+            }
+            (IdleNotificationKind::Inhibitor, ext_idle_notification_v1::Event::Idled) => {
+                info!("Idled (inhibitor-aware)");
+                match state.signal_sender.try_send(Signal::InhibitorIdled) {
+                    Ok(()) | Err(mpsc::TrySendError::Full(_)) => (),
+                    Err(mpsc::TrySendError::Disconnected(_)) => {
+                        panic!("Timer disconnected, `InhibitorIdled` signal could not be sent")
+                    }
+                }
+            }
+            (IdleNotificationKind::Inhibitor, ext_idle_notification_v1::Event::Resumed) => {
+                info!("Resumed (inhibitor-aware)");
+                match state.signal_sender.try_send(Signal::InhibitorResumed) {
+                    Ok(()) | Err(mpsc::TrySendError::Full(_)) => (),
+                    Err(mpsc::TrySendError::Disconnected(_)) => {
+                        panic!("Timer disconnected, `InhibitorResumed` signal could not be sent")
                     }
                 }
             }
