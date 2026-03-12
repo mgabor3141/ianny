@@ -164,6 +164,10 @@ fn show_passive_break(summary: &str, body: &str, duration: Duration) -> bool {
     skipped.load(Ordering::Relaxed)
 }
 
+fn drain_signals(signal_receiver: &mpsc::Receiver<wayland::Signal>) {
+    while signal_receiver.try_recv().is_ok() {}
+}
+
 /// Execute an action from the timer engine.
 fn execute_action(
     action: Action,
@@ -179,12 +183,40 @@ fn execute_action(
         } => {
             info!("Nudge: tier={tier_index}, summary={summary}");
 
-            // Check for idle during nudge
+            // Reset idle baseline at nudge start: ignore idle state accumulated
+            // before this nudge and only accept idleness after the reset window.
+            drain_signals(signal_receiver);
+
             let idle_detected = core::sync::atomic::AtomicBool::new(false);
+            let pending_early_idle = core::sync::atomic::AtomicBool::new(false);
+            let nudge_started = Instant::now();
+            let reset_window = Duration::from_secs(u64::from(CONFIG.timer.idle_detection_threshold));
+
             let check_idle = || {
-                if signal_receiver.try_recv() == Ok(wayland::Signal::Idled) {
+                while let Ok(signal) = signal_receiver.try_recv() {
+                    match signal {
+                        wayland::Signal::Idled => {
+                            if Instant::now().duration_since(nudge_started) >= reset_window {
+                                idle_detected.store(true, core::sync::atomic::Ordering::Relaxed);
+                            } else {
+                                pending_early_idle
+                                    .store(true, core::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
+                        wayland::Signal::Resumed => {
+                            pending_early_idle.store(false, core::sync::atomic::Ordering::Relaxed);
+                        }
+                        wayland::Signal::InhibitorIdled | wayland::Signal::InhibitorResumed => {}
+                    }
+                }
+
+                if !idle_detected.load(core::sync::atomic::Ordering::Relaxed)
+                    && pending_early_idle.load(core::sync::atomic::Ordering::Relaxed)
+                    && Instant::now().duration_since(nudge_started) >= reset_window
+                {
                     idle_detected.store(true, core::sync::atomic::Ordering::Relaxed);
                 }
+
                 idle_detected.load(core::sync::atomic::Ordering::Relaxed)
             };
 
@@ -197,7 +229,7 @@ fn execute_action(
             );
 
             // Drain signals
-            while signal_receiver.try_recv().is_ok() {}
+            drain_signals(signal_receiver);
 
             let follow_up = engine.nudge_result(went_idle, &CONFIG);
             execute_action(follow_up, engine, signal_receiver);
@@ -248,7 +280,7 @@ fn execute_action(
             );
 
             // Drain signals
-            while signal_receiver.try_recv().is_ok() {}
+            drain_signals(signal_receiver);
 
             if was_interrupted {
                 let follow_up = engine.break_interrupted(tier_index, elapsed.as_secs(), &CONFIG);
