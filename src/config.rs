@@ -13,9 +13,29 @@ pub struct Config {
 pub struct Sleep {
     /// Time of day to start sleep reminders, e.g. "23:00"
     pub start_time: String,
+    /// Time of day to end bedtime mode, e.g. "06:00". Default "06:00".
+    #[serde(default = "default_end_time")]
+    pub end_time: String,
     /// Escalating actions after `start_time`
     #[serde(default)]
     pub escalations: Vec<SleepEscalation>,
+}
+
+fn default_end_time() -> String {
+    "06:00".to_owned()
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[derive(Default)]
+pub enum Persistence {
+    /// Low urgency, short timeout (20s)
+    #[default]
+    Gentle,
+    /// Normal urgency, longer timeout (60s)
+    Firm,
+    /// Critical urgency, resident notification, repeats
+    Persistent,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -30,6 +50,11 @@ pub struct SleepEscalation {
     pub body: String,
     /// Shell command to run (optional)
     pub command: Option<String>,
+    /// How persistent this notification is
+    #[serde(default)]
+    pub persistence: Persistence,
+    /// For persistent escalations: repeat notification every N seconds
+    pub repeat_every: Option<u64>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -157,12 +182,35 @@ impl Default for Timer {
 impl Sleep {
     /// Parse `start_time` "HH:MM" into seconds since midnight.
     pub fn start_time_secs(&self) -> u64 {
-        let parts: Vec<&str> = self.start_time.split(':').collect();
-        assert!(parts.len() == 2, "Invalid start_time format: '{}' (expected HH:MM)", self.start_time);
-        let hours: u64 = parts[0].parse().expect("Invalid hour in start_time");
-        let minutes: u64 = parts[1].parse().expect("Invalid minute in start_time");
-        hours * 3600 + minutes * 60
+        parse_time_hhmm(&self.start_time, "start_time")
     }
+
+    /// Parse `end_time` "HH:MM" into seconds since midnight.
+    pub fn end_time_secs(&self) -> u64 {
+        parse_time_hhmm(&self.end_time, "end_time")
+    }
+
+    /// Whether `now_secs` (seconds since midnight) is in the bedtime window.
+    /// The window wraps around midnight: start_time..end_time the next day.
+    pub fn is_bedtime(&self, now_secs: u64) -> bool {
+        let start = self.start_time_secs();
+        let end = self.end_time_secs();
+        if start < end {
+            // Unusual: both on the same day (e.g. 22:00–23:30)
+            now_secs >= start && now_secs < end
+        } else {
+            // Normal: wraps midnight (e.g. 23:00–06:00)
+            now_secs >= start || now_secs < end
+        }
+    }
+}
+
+fn parse_time_hhmm(s: &str, field: &str) -> u64 {
+    let parts: Vec<&str> = s.split(':').collect();
+    assert!(parts.len() == 2, "Invalid {field} format: '{s}' (expected HH:MM)");
+    let hours: u64 = parts[0].parse().expect("Invalid hour in {field}");
+    let minutes: u64 = parts[1].parse().expect("Invalid minute in {field}");
+    hours * 3600 + minutes * 60
 }
 
 impl BreakTier {

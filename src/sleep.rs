@@ -102,24 +102,31 @@ mod tests {
     fn test_sleep_config() -> Sleep {
         Sleep {
             start_time: "23:00".to_owned(),
+            end_time: "06:00".to_owned(),
             escalations: vec![
                 SleepEscalation {
                     after: 0,
                     summary: Some("Bedtime".to_owned()),
                     body: "Time to sleep".to_owned(),
                     command: None,
+                    persistence: Default::default(),
+                    repeat_every: None,
                 },
                 SleepEscalation {
                     after: 1800,
                     summary: Some("Still up?".to_owned()),
                     body: "Go to bed".to_owned(),
                     command: Some("playerctl pause".to_owned()),
+                    persistence: Default::default(),
+                    repeat_every: None,
                 },
                 SleepEscalation {
                     after: 3600,
                     summary: None,
                     body: String::new(),
                     command: Some("echo grayscale".to_owned()),
+                    persistence: Default::default(),
+                    repeat_every: None,
                 },
             ],
         }
@@ -222,8 +229,31 @@ mod tests {
 
         let early = Sleep {
             start_time: "06:30".to_owned(),
+            end_time: "07:00".to_owned(),
             escalations: vec![],
         };
         assert_eq!(early.start_time_secs(), 6 * 3600 + 30 * 60);
+    }
+
+    #[test]
+    fn test_is_bedtime() {
+        let config = test_sleep_config(); // 23:00–06:00
+
+        // Before bedtime
+        assert!(!config.is_bedtime(22 * 3600));
+        assert!(!config.is_bedtime(10 * 3600));
+
+        // During bedtime (before midnight)
+        assert!(config.is_bedtime(23 * 3600));
+        assert!(config.is_bedtime(23 * 3600 + 1800));
+
+        // During bedtime (after midnight)
+        assert!(config.is_bedtime(0));
+        assert!(config.is_bedtime(3 * 3600));
+        assert!(config.is_bedtime(5 * 3600 + 3599));
+
+        // After bedtime ends
+        assert!(!config.is_bedtime(6 * 3600));
+        assert!(!config.is_bedtime(12 * 3600));
     }
 }
