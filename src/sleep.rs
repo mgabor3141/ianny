@@ -1,6 +1,8 @@
+use std::time::Instant;
+
 use log::info;
 
-use crate::config::Sleep;
+use crate::config::{Persistence, Sleep};
 
 /// Actions the sleep engine asks the caller to perform.
 #[derive(Debug, PartialEq, Eq)]
@@ -11,17 +13,31 @@ pub enum SleepAction {
         summary: Option<String>,
         body: String,
         command: Option<String>,
+        persistence: PersistenceHint,
     },
     /// No action needed.
     None,
+}
+
+/// Hint for the caller about how to display the notification.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum PersistenceHint {
+    /// Low urgency, 20s timeout
+    Gentle,
+    /// Normal urgency, 60s timeout
+    Firm,
+    /// Critical urgency, resident (no timeout)
+    Persistent,
 }
 
 /// Tracks sleep reminder escalation state.
 pub struct SleepEngine {
     /// Index of the next escalation to fire.
     next_escalation: usize,
-    /// Whether we've been in the "active" (past `start_time`) period.
+    /// Whether we've been in the bedtime window.
     was_active: bool,
+    /// For repeating escalations: when the last repeat was shown.
+    last_repeat: Option<Instant>,
 }
 
 impl SleepEngine {
@@ -29,36 +45,35 @@ impl SleepEngine {
         Self {
             next_escalation: 0,
             was_active: false,
+            last_repeat: None,
         }
+    }
+
+    /// Whether we are currently in bedtime mode.
+    pub fn is_bedtime(&self, now_secs: u64, config: &Sleep) -> bool {
+        config.is_bedtime(now_secs)
     }
 
     /// Check if any sleep escalation should fire.
     /// `now_secs`: current time as seconds since midnight.
     pub fn check(&mut self, now_secs: u64, config: &Sleep) -> SleepAction {
-        let start = config.start_time_secs();
-
-        // Determine if we're in the active window.
-        // Active = past start_time (handles wrapping past midnight).
-        // We consider active if now >= start_time OR now < 06:00 (still up from last night).
-        let active = now_secs >= start || now_secs < 6 * 3600;
+        let active = config.is_bedtime(now_secs);
 
         if !active {
-            // Before start_time and after 6 AM — reset for today
+            // Outside bedtime window — reset for today
             if self.was_active {
-                info!("Sleep: resetting escalations (new day)");
+                info!("Sleep: resetting escalations (bedtime ended)");
                 self.next_escalation = 0;
                 self.was_active = false;
+                self.last_repeat = None;
             }
             return SleepAction::None;
         }
 
         self.was_active = true;
 
-        if self.next_escalation >= config.escalations.len() {
-            return SleepAction::None; // all escalations fired
-        }
-
         // Calculate seconds elapsed since start_time
+        let start = config.start_time_secs();
         let elapsed = if now_secs >= start {
             now_secs - start
         } else {
@@ -66,15 +81,53 @@ impl SleepEngine {
             (24 * 3600 - start) + now_secs
         };
 
+        // Check if the current (already-fired) escalation wants to repeat
+        if self.next_escalation > 0 {
+            let prev = &config.escalations[self.next_escalation - 1];
+            if let Some(repeat_secs) = prev.repeat_every {
+                let should_repeat = match self.last_repeat {
+                    Some(last) => last.elapsed().as_secs() >= repeat_secs,
+                    None => true, // first repeat after initial fire
+                };
+                // Only repeat if we've exhausted new escalations or the next one
+                // hasn't triggered yet
+                let next_not_ready = self.next_escalation >= config.escalations.len()
+                    || elapsed < config.escalations[self.next_escalation].after;
+
+                if should_repeat && next_not_ready {
+                    self.last_repeat = Some(Instant::now());
+                    info!(
+                        "Sleep: repeating escalation {} (every {}s)",
+                        self.next_escalation - 1,
+                        repeat_secs
+                    );
+                    return SleepAction::Escalate {
+                        index: self.next_escalation - 1,
+                        summary: prev.summary.clone(),
+                        body: prev.body.clone(),
+                        command: None, // don't re-run commands on repeat
+                        persistence: persistence_hint(&prev.persistence),
+                    };
+                }
+            }
+        }
+
+        if self.next_escalation >= config.escalations.len() {
+            return SleepAction::None; // all escalations fired, no repeat
+        }
+
         let escalation = &config.escalations[self.next_escalation];
 
         if elapsed >= escalation.after {
             let idx = self.next_escalation;
             self.next_escalation += 1;
+            self.last_repeat = None; // reset repeat timer for new escalation
 
             info!(
-                "Sleep escalation {idx}: after={}s, elapsed={elapsed}s, summary={:?}, command={:?}",
-                escalation.after, escalation.summary, escalation.command
+                "Sleep escalation {idx}: after={}s, elapsed={elapsed}s, \
+                 persistence={:?}, summary={:?}, command={:?}",
+                escalation.after, escalation.persistence,
+                escalation.summary, escalation.command
             );
 
             SleepAction::Escalate {
@@ -82,6 +135,7 @@ impl SleepEngine {
                 summary: escalation.summary.clone(),
                 body: escalation.body.clone(),
                 command: escalation.command.clone(),
+                persistence: persistence_hint(&escalation.persistence),
             }
         } else {
             SleepAction::None
@@ -91,6 +145,14 @@ impl SleepEngine {
     #[cfg(test)]
     pub fn next_escalation(&self) -> usize {
         self.next_escalation
+    }
+}
+
+fn persistence_hint(p: &Persistence) -> PersistenceHint {
+    match p {
+        Persistence::Gentle => PersistenceHint::Gentle,
+        Persistence::Firm => PersistenceHint::Firm,
+        Persistence::Persistent => PersistenceHint::Persistent,
     }
 }
 
@@ -212,12 +274,11 @@ mod tests {
         let config = test_sleep_config();
         let mut engine = SleepEngine::new();
 
-        // Fire first escalation
+        // Fire first escalation at 23:00
         let _ = engine.check(23 * 3600, &config);
         assert_eq!(engine.next_escalation(), 1);
 
-        // Next day, 10:00 AM — resets
-        engine.was_active = true; // simulate having been active
+        // Next day, 10:00 AM — outside bedtime window, resets
         let _ = engine.check(10 * 3600, &config);
         assert_eq!(engine.next_escalation(), 0);
     }
