@@ -14,7 +14,7 @@ use log::{error, info};
 use notify_rust::{Hint, Notification, Timeout, Urgency};
 use single_instance::SingleInstance;
 
-use sleep::{SleepAction, SleepEngine};
+use sleep::{PersistenceHint, SleepAction, SleepEngine};
 use timer::{Action, TimerEngine};
 
 const APP_ID: &str = "io.github.zefr0x.ianny";
@@ -31,44 +31,6 @@ fn now_secs_since_midnight() -> u64 {
         .unwrap_or_else(|_| time::OffsetDateTime::now_utc());
     let (h, m, s) = now.time().as_hms();
     u64::from(h) * 3600 + u64::from(m) * 60 + u64::from(s)
-}
-
-/// Check if current time is past the configured sleep `start_time`.
-fn is_sleep_time() -> bool {
-    let Some(ref sleep) = CONFIG.sleep else {
-        return false;
-    };
-    let now = now_secs_since_midnight();
-    let start = sleep.start_time_secs();
-    // Active if past start_time OR before 6 AM (still up from last night)
-    now >= start || now < 6 * 3600
-}
-
-/// Replace break notification text with sleep-relevant messages.
-fn override_for_sleep(action: Action) -> Action {
-    match action {
-        Action::ShowNudge {
-            tier_index,
-            nudge_duration,
-            ..
-        } => Action::ShowNudge {
-            tier_index,
-            summary: "You should be sleeping 😴".to_owned(),
-            body: "It's past bedtime — go to bed instead of taking a break".to_owned(),
-            nudge_duration,
-        },
-        Action::ShowPassiveBreak {
-            tier_index,
-            duration,
-            ..
-        } => Action::ShowPassiveBreak {
-            tier_index,
-            summary: "You should be sleeping 😴".to_owned(),
-            body: "It's past bedtime — go to bed instead of taking a break".to_owned(),
-            duration,
-        },
-        other => other,
-    }
 }
 
 fn urgency_hint() -> Hint {
@@ -166,6 +128,29 @@ fn show_passive_break(summary: &str, body: &str, duration: Duration) -> bool {
 
 fn drain_signals(signal_receiver: &mpsc::Receiver<wayland::Signal>) {
     while signal_receiver.try_recv().is_ok() {}
+}
+
+/// Show a bedtime notification with persistence-appropriate styling.
+fn show_sleep_notification(summary: &str, body: &str, persistence: PersistenceHint) {
+    let (urgency, timeout, resident) = match persistence {
+        PersistenceHint::Gentle => (Urgency::Low, Timeout::Milliseconds(20_000), false),
+        PersistenceHint::Firm => (Urgency::Normal, Timeout::Milliseconds(60_000), false),
+        PersistenceHint::Persistent => (Urgency::Critical, Timeout::Never, true),
+    };
+
+    let mut notification = Notification::new();
+    notification
+        .summary(summary)
+        .body(body)
+        .appname("Ianny")
+        .hint(Hint::Urgency(urgency))
+        .timeout(timeout);
+
+    if resident {
+        notification.hint(Hint::Resident(true));
+    }
+
+    let _handle: Result<_, _> = notification.show();
 }
 
 /// Execute an action from the timer engine.
@@ -460,50 +445,47 @@ fn main() -> ! {
                 continue;
             }
 
-            // Tick the engine
-            let action = engine.tick(monotonic_elapsed, &CONFIG, inhibitors_active);
-            if action != Action::None {
-                let action = if is_sleep_time() {
-                    override_for_sleep(action)
-                } else {
-                    action
-                };
-                execute_action(action, &mut engine, &signal_receiver);
-                last_monotonic = Instant::now();
-                last_wallclock = SystemTime::now();
-            }
+            // Check if we're in bedtime mode
+            let bedtime = CONFIG.sleep.as_ref().is_some_and(|sleep_config| {
+                sleep_engine.is_bedtime(now_secs_since_midnight(), sleep_config)
+            });
 
-            // Check sleep reminders
-            if let Some(ref sleep_config) = CONFIG.sleep {
+            if bedtime {
+                // Bedtime mode: skip all break logic, only run sleep escalations
                 let now = now_secs_since_midnight();
-                let sleep_action = sleep_engine.check(now, sleep_config);
-                if let SleepAction::Escalate {
-                    summary,
-                    body,
-                    command,
-                    ..
-                } = sleep_action
-                {
-                    if let Some(ref s) = summary {
-                        let _handle: Result<_, _> = Notification::new()
-                            .summary(s)
-                            .body(&body)
-                            .appname("Ianny")
-                            .hint(urgency_hint())
-                            .timeout(Timeout::Milliseconds(30_000))
-                            .show();
-                    }
-                    if let Some(ref cmd) = command {
-                        info!("Sleep: running command: {cmd}");
-                        match std::process::Command::new("sh")
-                            .arg("-c")
-                            .arg(cmd)
-                            .spawn()
-                        {
-                            Ok(_) => {}
-                            Err(e) => error!("Sleep: command failed: {e}"),
+                if let Some(ref sleep_config) = CONFIG.sleep {
+                    let sleep_action = sleep_engine.check(now, sleep_config);
+                    if let SleepAction::Escalate {
+                        summary,
+                        body,
+                        command,
+                        persistence,
+                        ..
+                    } = sleep_action
+                    {
+                        if let Some(ref s) = summary {
+                            show_sleep_notification(s, &body, persistence);
+                        }
+                        if let Some(ref cmd) = command {
+                            info!("Sleep: running command: {cmd}");
+                            match std::process::Command::new("sh")
+                                .arg("-c")
+                                .arg(cmd)
+                                .spawn()
+                            {
+                                Ok(_) => {}
+                                Err(e) => error!("Sleep: command failed: {e}"),
+                            }
                         }
                     }
+                }
+            } else {
+                // Work mode: run break logic, no sleep reminders
+                let action = engine.tick(monotonic_elapsed, &CONFIG, inhibitors_active);
+                if action != Action::None {
+                    execute_action(action, &mut engine, &signal_receiver);
+                    last_monotonic = Instant::now();
+                    last_wallclock = SystemTime::now();
                 }
             }
         }
